@@ -700,6 +700,15 @@ class MainWindow(QWidget):
         )
         self._schedule_cb.stateChanged.connect(self._toggle_schedule)
         header.addWidget(self._schedule_cb)
+
+        self._btn_quit = QPushButton("Quit")
+        self._btn_quit.setStyleSheet(
+            "QPushButton { background:#3a1a1a; border:1px solid #5a2a2a; "
+            "border-radius:4px; color:#dd8888; padding:6px 14px; }"
+            "QPushButton:hover { background:#5a2a2a; color:#ffffff; }"
+        )
+        self._btn_quit.clicked.connect(self.close)
+        header.addWidget(self._btn_quit)
         root.addLayout(header)
 
         tabs = QTabWidget()
@@ -716,6 +725,18 @@ class MainWindow(QWidget):
             enable_schedule()
         else:
             disable_schedule()
+
+    def closeEvent(self, event):
+        # Let any in-flight scan/clean threads finish before the process exits —
+        # quitting mid-scan would tear down Qt objects a worker thread still uses.
+        for thread in (
+            getattr(self._clean_tab, "_scan_thread", None),
+            getattr(self._clean_tab, "_clean_thread", None),
+            getattr(self._disk_tab, "_thread", None),
+        ):
+            if thread is not None and thread.isRunning():
+                thread.wait(5000)
+        event.accept()
 
 
 def main():
