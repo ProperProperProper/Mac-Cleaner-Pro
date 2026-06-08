@@ -737,6 +737,9 @@ class MainWindow(QWidget):
             if thread is not None and thread.isRunning():
                 thread.wait(5000)
         event.accept()
+        # On macOS, closing the last window leaves the app running in the
+        # background — explicitly quit so "Quit" actually ends the process.
+        QApplication.instance().quit()
 
 
 def main():
