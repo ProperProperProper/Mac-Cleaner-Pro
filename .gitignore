@@ -1,7 +1,21 @@
+# Rust build output
+target/
+# Generated audit reports (may describe this machine)
+reports/
+# Backup of the previously installed app bundle (not source)
+backup/
+# Never commit secrets
+.env
+.env.*
+*.key
+*.pem
+# macOS / packaging
+.DS_Store
+*.app
+*.dmg
+# Old Python build artefacts
 __pycache__/
 *.pyc
 build/
 dist/
 *.spec
-*.app
-*.dmg

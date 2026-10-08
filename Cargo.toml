@@ -1,0 +1,27 @@
+[package]
+name = "mac-cleaner-pro"
+version = "2.0.0"
+edition = "2024"
+description = "Transparent macOS disk cleaner and security audit/fix tool (pure Rust)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "mac_cleaner_pro"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mac-cleaner-pro"
+path = "src/main.rs"
+
+[dependencies]
+chrono = "0.4.45"
+eframe = "0.36.2"
+rfd = "0.17.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+[profile.release]
+opt-level = 3
+strip = true
