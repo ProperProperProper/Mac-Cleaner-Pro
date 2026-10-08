@@ -438,7 +438,7 @@ impl App {
                             }
                             ui.horizontal_wrapped(|ui| {
                                 for fx in &f.fixes {
-                                    let label = if fx.opens_settings() { fx.label.clone() } else { format!("Fix: {}", fx.label) };
+                                    let label = if fx.opens_settings() || fx.is_trust_action() { fx.label.clone() } else { format!("Fix: {}", fx.label) };
                                     if ui.add_enabled(!self.action_busy, egui::Button::new(label)).clicked() {
                                         self.pending_fix = Some((*i, (*f).clone(), fx.clone()));
                                     }
@@ -492,7 +492,15 @@ impl App {
             }
             ui.separator();
             ui.horizontal(|ui| {
-                let label = if self.dry_run { "Preview" } else if fx.opens_settings() { "Open" } else { "Apply" };
+                let label = if self.dry_run {
+                    "Preview"
+                } else if fx.opens_settings() {
+                    "Open"
+                } else if fx.is_trust_action() {
+                    "Confirm"
+                } else {
+                    "Apply"
+                };
                 if ui.button(RichText::new(label).strong()).clicked() {
                     apply = true;
                 }

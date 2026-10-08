@@ -39,6 +39,11 @@ pub enum Step {
     /// Back up a shell rc file, import the variables into the Keychain, and
     /// rewrite those lines to read from the Keychain at shell start-up.
     RcToKeychain { file: String, keys: Vec<String>, service: String, backup: String },
+    /// Record a startup item as trusted by the user (label + program + the
+    /// SHA-256 the user reviewed; refused if the program changed since).
+    Trust { file: String, label: String, program: String, sha256: String },
+    /// Remove a startup item's trust entry.
+    Untrust { file: String, label: String, program: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -77,6 +82,10 @@ impl Fix {
     }
     pub fn opens_settings(&self) -> bool {
         self.steps.iter().all(|s| matches!(s, Step::Open { .. }))
+    }
+    /// Only records/removes a "trusted by you" entry (changes nothing on the system).
+    pub fn is_trust_action(&self) -> bool {
+        !self.steps.is_empty() && self.steps.iter().all(|s| matches!(s, Step::Trust { .. } | Step::Untrust { .. }))
     }
     pub fn preview(&self) -> Vec<String> {
         self.steps.iter().map(preview_step).collect()
@@ -161,6 +170,14 @@ pub fn preview_step(s: &Step) -> String {
             k = keys.join(", "),
             s = sh_quote(service)
         ),
+        Step::Trust { file, label, program, sha256 } => format!(
+            "record in {}: trust {} running {} (sha256 {})",
+            sh_quote(file),
+            sh_quote(label),
+            sh_quote(program),
+            sha256.get(..16).unwrap_or(sha256)
+        ),
+        Step::Untrust { file, label, program } => format!("remove from {}: trust entry for {} running {}", sh_quote(file), sh_quote(label), sh_quote(program)),
     }
 }
 
@@ -283,6 +300,8 @@ fn apply_step(s: &Step) -> Result<(), String> {
             }
             std::fs::write(file, rc_rewrite(&text, keys, service)).map_err(|e| e.to_string())
         }
+        Step::Trust { file, label, program, sha256 } => super::trusted::apply_trust(Path::new(file), label, program, sha256),
+        Step::Untrust { file, label, program } => super::trusted::apply_untrust(Path::new(file), label, program),
     }
 }
 

@@ -41,8 +41,8 @@ The cleaner will never:
 | Network | Listening TCP/UDP sockets (`lsof` + `netstat`), split into local-only vs reachable from the network, with known services identified; DNS servers; web/SOCKS/PAC proxies; `/etc/hosts` overrides of sensitive domains; current Wi-Fi security type (the network name is never read) |
 | Sharing | Remote Login (SSH), Screen Sharing, File Sharing, Remote Management (ARD), Remote Apple Events, Printer Sharing, Internet Sharing, AirPlay Receiver (`AirplayRecieverEnabled`, Apple's spelling, plus ports 5000/7000), Bluetooth Sharing |
 | Accounts & device | Admin users, guest account, automatic login, password required after sleep/screensaver, screensaver/display-sleep timeout, Find My / Activation Lock, Lockdown Mode |
-| Startup items | `~/Library/LaunchAgents`, `/Library/LaunchAgents`, `/Library/LaunchDaemons`: the program each one runs, whether it exists, its code signature (`codesign`, `spctl`). Unsigned items are flagged for *review*, not called malware. Also login items (opt-in, because listing them needs an Automation prompt), cron, periodic scripts, login/logout hooks |
-| Apps & extensions | Apps in `/Applications` and `~/Applications` that Gatekeeper rejects; Chrome/Brave/Edge/Chromium/Vivaldi/Arc/Firefox extensions with all-site or native access (Safari is not inspected, to avoid a privacy prompt) |
+| Startup items | `~/Library/LaunchAgents`, `/Library/LaunchAgents`, `/Library/LaunchDaemons`: the program each one runs, whether it exists, its code signature (`codesign`, `spctl`). Unsigned items are flagged for *review*, not called malware; items you built yourself can be marked as trusted (see below). Also login items (opt-in, because listing them needs an Automation prompt), cron, periodic scripts, login/logout hooks |
+| Apps & extensions | Apps in `/Applications` and `~/Applications` that Gatekeeper rejects. App Store iPhone/iPad apps running on Apple silicon (wrapped bundles with a `Wrapper/` folder or `WrappedBundle` link and no `Contents/Info.plist`) are always rejected by `spctl`, so their Apple App Store signature and team are verified with `codesign` instead and reported OK. Apps with a verified Developer ID signature that Gatekeeper rejects only because they aren't notarized are reported as info ("signed by X, not notarized"); unsigned, ad-hoc, tampered or revoked apps stay warnings; Chrome/Brave/Edge/Chromium/Vivaldi/Arc/Firefox extensions with all-site or native access (Safari is not inspected, to avoid a privacy prompt) |
 | Trust | Certificates with custom trust settings (possible HTTPS interception); `/etc/sudoers.d` and passwordless sudo rules (`sudo -n -l`, never prompts) |
 | Plaintext secrets | Shell rc files, common credential files (`.netrc`, `.aws/credentials`, `.npmrc`, `.docker/config.json`…), launch-agent environment variables, and `.env*` / `config.json` / `*credentials*` / `*.pem` / `*.key` under `~/Projects` (skipping `target/`, `node_modules/`, `.git/`, venvs). For each file it reports whether git tracks or ignores it, and whether the GitHub repo is public (read-only `gh repo view`). It also flags tokens embedded in git remote URLs |
 | Files, SSH & privacy | `~/.ssh` and private-key permissions, `authorized_keys`, world-writable files in `~/Projects` and launch-agent folders, home folder mode, whether this app/Terminal has Full Disk Access |
@@ -54,6 +54,14 @@ Rules the audit follows:
 - **Secret values are never displayed, logged or exported.** Only file paths and variable/key names are shown. A unit test checks that the report and the fix plans never contain test values.
 - **No privacy prompts.** The audit never reads `~/Desktop`, `~/Documents`, `~/Downloads`, Photos, Mail or Safari data, and never follows symlinks.
 - If a check can't run (tool missing, permission denied, timeout), it shows "could not check" instead of crashing.
+
+## Security: trusted startup items
+
+Programs and scripts you built yourself (ad-hoc signed or unsigned) are flagged for review. If you recognise one, click **Mark as trusted** on it in the Security tab (or run `mac-cleaner-pro --trust <label>`). It is then shown as info, "trusted by you", with an **Untrust** button.
+
+- Trust is stored in `~/Library/Application Support/Mac Cleaner Pro/trusted-startup-items.json` (mode 600).
+- Each entry is keyed by the plist label, the program path and the SHA-256 of the program file. If the binary or script changes, trust is dropped automatically and the item is flagged again.
+- Nothing is ever trusted automatically. Marking and untrusting are logged in History with undo.
 
 ## Security: fixing things
 
@@ -114,6 +122,8 @@ mac-cleaner-pro --audit [--output report.md] [--with-login-items]   # security r
 mac-cleaner-pro --fix-preview      # every available fix + exact commands; executes nothing
 mac-cleaner-pro --dry-run-clean    # what the cleaner would remove, with sizes; deletes nothing
 mac-cleaner-pro --background-scan  # what the weekly job runs
+mac-cleaner-pro --trust <label>    # mark an installed startup item as trusted by you
+mac-cleaner-pro --untrust <label>  # remove that trust
 ```
 
 Inside the app bundle the binary is `/Applications/Mac Cleaner Pro.app/Contents/MacOS/mac-cleaner-pro`.
@@ -132,7 +142,7 @@ Layout:
 - `src/cleaner.rs`: scan/clean/disk usage
 - `src/history.rs`: SQLite log
 - `src/schedule.rs`: weekly launchd job
-- `src/security/`: audit checks (`checks/*.rs`), fix plans and execution (`fix.rs`), report (`report.rs`)
+- `src/security/`: audit checks (`checks/*.rs`), fix plans and execution (`fix.rs`), user-trusted startup items (`trusted.rs`), report (`report.rs`)
 - `src/gui.rs`: GUI
 - `src/cli.rs`: command line
 - `icon.icns`: static app icon

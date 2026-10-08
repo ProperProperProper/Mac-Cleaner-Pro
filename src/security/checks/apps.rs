@@ -2,7 +2,7 @@
 
 use super::super::fix::{Fix, run};
 use super::super::{Category::Apps, Ctx, Finding, Status};
-use super::persistence::parse_spctl;
+use super::persistence::{Sig, parse_codesign, parse_executable, parse_spctl, parse_team};
 use crate::cmd;
 use crate::util::tilde;
 use std::path::{Path, PathBuf};
@@ -24,14 +24,111 @@ pub fn list_apps(dirs: &[PathBuf]) -> Vec<PathBuf> {
     v
 }
 
+/// App Store iPhone/iPad app wrapped for Apple silicon: no `Contents/Info.plist`,
+/// but a `Wrapper/` folder and/or a `WrappedBundle` link. Gatekeeper (`spctl`)
+/// rejects these by design. Never follows symlinks.
+pub fn is_wrapped_ios(app: &Path) -> bool {
+    if app.join("Contents").join("Info.plist").symlink_metadata().is_ok() {
+        return false;
+    }
+    let wrapper = app.join("Wrapper").symlink_metadata().map(|m| m.is_dir()).unwrap_or(false);
+    let link = app.join("WrappedBundle").symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false);
+    wrapper || link
+}
+
+/// `codesign --verify` message for App Store iOS bundles, which use iOS-style
+/// resource rules; strict verification always reports it for them.
+pub const IOS_OBSOLETE_ENVELOPE: &str = "resource envelope is obsolete (custom omit rules)";
+/// `codesign --verify` message when a correctly signed standalone executable is
+/// used as a bundle's main executable (e.g. Claude Code's URL handler).
+pub const NO_RESOURCES: &str = "code has no resources but signature indicates they must be present";
+
+/// True if `out` (codesign --verify stderr) reports failures, and every one of them is `reason`.
+pub fn only_reason(out: &str, reason: &str) -> bool {
+    let lines: Vec<&str> = out.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("In architecture")).collect();
+    !lines.is_empty() && lines.iter().all(|l| l.contains(reason))
+}
+
+/// Facts gathered about an app Gatekeeper rejected.
+#[derive(Debug, Clone, Default)]
+pub struct RejectedApp {
+    pub wrapped_ios: bool,
+    /// `codesign -dvv <app>` output.
+    pub codesign_dv: String,
+    /// `codesign --verify --deep --strict <app>`: passed?, output.
+    pub verify_strict: (bool, String),
+    /// Second verification, run only when the strict one failed solely with a
+    /// known benign reason: `--deep --no-strict` on the bundle for
+    /// [`IOS_OBSOLETE_ENVELOPE`] (still checks every hash and the designated
+    /// requirement), `--strict` on the main executable for [`NO_RESOURCES`].
+    pub verify_fallback: Option<bool>,
+    /// `spctl -a -vv <app>` output.
+    pub spctl: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AppVerdict {
+    /// Signed by Apple for App Store distribution, signature verified.
+    IosAppStore { team: String },
+    /// Valid Developer ID signature; Gatekeeper rejects it only for lack of notarization.
+    SignedNotNotarized { signer: String },
+    Rejected,
+}
+
+pub fn signature_verified(r: &RejectedApp, benign: &str) -> bool {
+    r.verify_strict.0 || (only_reason(&r.verify_strict.1, benign) && r.verify_fallback == Some(true))
+}
+
+pub fn classify_rejected(r: &RejectedApp) -> AppVerdict {
+    let Some(team) = parse_team(&r.codesign_dv) else { return AppVerdict::Rejected };
+    let revoked = r.spctl.to_ascii_lowercase().contains("revoked");
+    if revoked {
+        return AppVerdict::Rejected;
+    }
+    let iphone_signed = r.codesign_dv.lines().any(|l| l.starts_with("Authority=Apple iPhone OS Application Signing"));
+    if r.wrapped_ios && iphone_signed && signature_verified(r, IOS_OBSOLETE_ENVELOPE) {
+        return AppVerdict::IosAppStore { team };
+    }
+    if !r.wrapped_ios
+        && let Sig::DeveloperId(auth) = parse_codesign(&r.codesign_dv)
+        && auth.contains(&format!("({team})"))
+        && signature_verified(r, NO_RESOURCES)
+    {
+        let signer = auth.strip_prefix("Developer ID Application: ").unwrap_or(&auth).to_string();
+        return AppVerdict::SignedNotNotarized { signer };
+    }
+    AppVerdict::Rejected
+}
+
+fn gather_rejected(app: &Path, spctl: String) -> RejectedApp {
+    let ps = app.display().to_string();
+    let run = |args: &[&str]| cmd::run_timeout("codesign", args, Duration::from_secs(120)).map(|o| (o.success(), o.combined())).unwrap_or((false, String::new()));
+    let codesign_dv = run(&["-dvv", &ps]).1;
+    let wrapped_ios = is_wrapped_ios(app);
+    let verify_strict = run(&["--verify", "--deep", "--strict", &ps]);
+    let mut verify_fallback = None;
+    if !verify_strict.0 {
+        if wrapped_ios && only_reason(&verify_strict.1, IOS_OBSOLETE_ENVELOPE) {
+            verify_fallback = Some(run(&["--verify", "--deep", "--no-strict", &ps]).0);
+        } else if only_reason(&verify_strict.1, NO_RESOURCES)
+            && let Some(exe) = parse_executable(&codesign_dv)
+        {
+            verify_fallback = Some(run(&["--verify", "--strict", &exe]).0);
+        }
+    }
+    RejectedApp { wrapped_ios, codesign_dv, verify_strict, verify_fallback, spctl }
+}
+
 pub fn app_signatures(ctx: &Ctx) -> Vec<Finding> {
     let t = "App signatures & notarization";
     let apps = list_apps(&[PathBuf::from("/Applications"), ctx.home.join("Applications")]);
     if apps.is_empty() {
         return vec![Finding::unknown(Apps, t, "no apps found in /Applications")];
     }
+    let own = |p: &Path| p.file_name().is_some_and(|n| n == "Mac Cleaner Pro.app");
     // Assess in parallel (spctl can take ~0.5 s per app).
-    let results: Vec<(PathBuf, bool, String)> = std::thread::scope(|s| {
+    type Assessed = (PathBuf, bool, String, Option<RejectedApp>);
+    let results: Vec<Assessed> = std::thread::scope(|s| {
         let chunks: Vec<Vec<PathBuf>> = apps.chunks(apps.len().div_ceil(8)).map(|c| c.to_vec()).collect();
         let hs: Vec<_> = chunks
             .into_iter()
@@ -40,10 +137,10 @@ pub fn app_signatures(ctx: &Ctx) -> Vec<Finding> {
                     c.into_iter()
                         .map(|p| {
                             let ps = p.display().to_string();
-                            let (ok, src) = cmd::run_timeout("spctl", &["-a", "-vv", &ps], Duration::from_secs(60))
-                                .map(|o| parse_spctl(&o.combined()))
-                                .unwrap_or((false, "could not assess".into()));
-                            (p, ok, src)
+                            let raw = cmd::run_timeout("spctl", &["-a", "-vv", &ps], Duration::from_secs(60)).map(|o| o.combined()).unwrap_or_default();
+                            let (ok, src) = if raw.is_empty() { (false, "could not assess".into()) } else { parse_spctl(&raw) };
+                            let extra = (!ok && !own(&p)).then(|| gather_rejected(&p, raw));
+                            (p, ok, src, extra)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -51,37 +148,90 @@ pub fn app_signatures(ctx: &Ctx) -> Vec<Finding> {
             .collect();
         hs.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
     });
-    let mut out = vec![];
-    let own = |p: &Path| p.file_name().is_some_and(|n| n == "Mac Cleaner Pro.app");
-    let rejected: Vec<&(PathBuf, bool, String)> = results.iter().filter(|(p, ok, _)| !ok && !own(p)).collect();
     let mut by_src: std::collections::BTreeMap<String, usize> = Default::default();
-    for (_, ok, s) in &results {
+    for (_, ok, s, _) in &results {
         if *ok {
             *by_src.entry(if s.is_empty() { "accepted".into() } else { s.clone() }).or_default() += 1;
         }
     }
-    let summary_ev: Vec<String> = by_src.iter().map(|(s, n)| format!("{n} app(s): {s}")).collect();
-    let why = "Gatekeeper rejects apps that are unsigned, not notarized by Apple, or whose signature is broken (possibly modified after signing). Such apps are not necessarily malicious (open-source builds often are unsigned) but deserve a second look.";
-    out.push(if rejected.is_empty() {
-        Finding::new(Apps, t, Status::Ok, format!("All {} apps pass Gatekeeper.", results.len())).evidence_all(summary_ev).explain(why)
-    } else {
-        Finding::new(Apps, t, Status::Info, format!("{} of {} apps pass Gatekeeper; {} need review (listed separately).", results.len() - rejected.len(), results.len(), rejected.len()))
-            .evidence_all(summary_ev)
-            .explain(why)
-    });
-    for (p, _, src) in rejected {
+    let why = "Gatekeeper rejects apps that are unsigned, not notarized by Apple, or whose signature is broken (possibly modified after signing). Such apps are not necessarily malicious (open-source builds often are unsigned) but deserve a second look. App Store iPhone/iPad apps running on Apple silicon are always rejected by Gatekeeper's check by design; their Apple App Store signature is verified separately.";
+    let mut items = vec![];
+    let (mut n_ios, mut n_unnot, mut n_rej) = (0, 0, 0);
+    for (p, _, src, extra) in &results {
+        let Some(r) = extra else { continue };
         let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let ps = p.display().to_string();
-        let quarantined = cmd::run("xattr", &["-p", "com.apple.quarantine", &ps]).map(|o| o.success()).unwrap_or(false);
-        out.push(
-            Finding::new(Apps, format!("App: {name}"), Status::Warning, format!("{name} is rejected by Gatekeeper{}.", if src.is_empty() { String::new() } else { format!(" ({src})") }))
-                .evidence(format!("path: {}", tilde(p)))
-                .evidence(format!("quarantine attribute present: {quarantined}{}", if quarantined { "" } else { " (removed or never downloaded via a browser)" }))
-                .explain(why)
-                .fix_text("If you don't recognise it or no longer need it, quit it and move it to the Trash. Re-download apps from the developer's official site or the App Store.")
-                .with_fix(Fix::new("Show in Finder").change("Opens a Finder window with the app selected (changes nothing)").step(run(&["open", "-R", &ps]))),
-        );
+        let title = format!("App: {name}");
+        let ident = r.codesign_dv.lines().find_map(|l| l.strip_prefix("Identifier=")).unwrap_or("?").to_string();
+        let gk = format!("Gatekeeper (spctl): rejected{}", if src.is_empty() { String::new() } else { format!(" ({src})") });
+        let finder = Fix::new("Show in Finder").change("Opens a Finder window with the app selected (changes nothing)").step(run(&["open", "-R", &ps]));
+        match classify_rejected(r) {
+            AppVerdict::IosAppStore { team } => {
+                n_ios += 1;
+                items.push(
+                    Finding::new(Apps, title, Status::Ok, format!("App Store iPhone/iPad app, signed by team {team}."))
+                        .evidence(format!("path: {}", tilde(p)))
+                        .evidence(format!("identifier: {ident}, team: {team}, signed by Apple iPhone OS Application Signing"))
+                        .evidence(if r.verify_strict.0 {
+                            "codesign --verify --deep --strict: valid".to_string()
+                        } else {
+                            format!("codesign --verify --deep: valid, satisfies its designated requirement (strict mode only reports \"{IOS_OBSOLETE_ENVELOPE}\", normal for App Store iOS apps)")
+                        })
+                        .evidence(format!("{gk} — expected: Gatekeeper does not assess wrapped iOS apps"))
+                        .explain(why),
+                );
+            }
+            AppVerdict::SignedNotNotarized { signer } => {
+                n_unnot += 1;
+                let mut f = Finding::new(Apps, title, Status::Info, format!("{name} is signed by {signer}, not notarized."))
+                    .evidence(format!("path: {}", tilde(p)))
+                    .evidence(format!("identifier: {ident}, Developer ID signature verified (codesign)"));
+                if !r.verify_strict.0 {
+                    f = f.evidence(format!("bundle check reports \"{NO_RESOURCES}\"; the main executable's own signature is valid"));
+                }
+                if let Some(exe) = parse_executable(&r.codesign_dv)
+                    && let Ok(link) = std::fs::read_link(&exe)
+                {
+                    f = f.evidence(format!("main executable is a link to {}", tilde(&link)));
+                }
+                items.push(f.evidence(gk).explain(why).fix_text("The developer is identified by Apple's Developer ID. Keep it if you installed it on purpose.").with_fix(finder));
+            }
+            AppVerdict::Rejected => {
+                n_rej += 1;
+                let quarantined = cmd::run("xattr", &["-p", "com.apple.quarantine", &ps]).map(|o| o.success()).unwrap_or(false);
+                items.push(
+                    Finding::new(Apps, title, Status::Warning, format!("{name} is rejected by Gatekeeper{}.", if src.is_empty() { String::new() } else { format!(" ({src})") }))
+                        .evidence(format!("path: {}", tilde(p)))
+                        .evidence(format!("signature: {}", parse_codesign(&r.codesign_dv).describe()))
+                        .evidence(format!("quarantine attribute present: {quarantined}{}", if quarantined { "" } else { " (removed or never downloaded via a browser)" }))
+                        .explain(why)
+                        .fix_text("If you don't recognise it or no longer need it, quit it and move it to the Trash. Re-download apps from the developer's official site or the App Store.")
+                        .with_fix(finder),
+                );
+            }
+        }
     }
+    let mut summary_ev: Vec<String> = by_src.iter().map(|(s, n)| format!("{n} app(s): {s}")).collect();
+    if n_ios > 0 {
+        summary_ev.push(format!("{n_ios} app(s): App Store iPhone/iPad apps (signature verified)"));
+    }
+    if n_unnot > 0 {
+        summary_ev.push(format!("{n_unnot} app(s): Developer ID signed, not notarized"));
+    }
+    let accepted = results.iter().filter(|(_, ok, _, _)| *ok).count();
+    let mut out = vec![if n_rej == 0 && n_unnot == 0 {
+        Finding::new(Apps, t, Status::Ok, format!("All {} apps pass Gatekeeper or are verified App Store iPhone/iPad apps.", results.len())).evidence_all(summary_ev).explain(why)
+    } else {
+        Finding::new(
+            Apps,
+            t,
+            Status::Info,
+            format!("{accepted} of {} apps pass Gatekeeper; {n_ios} verified App Store iPhone/iPad app(s), {n_unnot} signed but not notarized, {n_rej} need review (listed separately).", results.len()),
+        )
+        .evidence_all(summary_ev)
+        .explain(why)
+    }];
+    out.extend(items);
     out
 }
 
@@ -230,6 +380,92 @@ mod tests {
         assert_eq!(n, "Dark");
         assert_eq!(risky_of(&p), vec!["https://*/*"]);
         assert!(parse_chromium_manifest("{}", None).is_none());
+    }
+
+    const IOS_DV: &str = "Executable=/Applications/Grays.app/Wrapper/Runner.app/Runner\nIdentifier=grays.GraysOnline\nFormat=app bundle with Mach-O thin (arm64)\nAuthority=Apple iPhone OS Application Signing\nAuthority=Apple iPhone Certification Authority\nAuthority=Apple Root CA\nTeamIdentifier=7C9N6X87GL\n";
+    const DEVID_DV: &str = "Executable=/Users/x/Applications/Claude Code URL Handler.app/Contents/MacOS/claude\nIdentifier=com.anthropic.claude-code\nAuthority=Developer ID Application: Anthropic PBC (Q6L2SF6YDW)\nAuthority=Developer ID Certification Authority\nAuthority=Apple Root CA\nTeamIdentifier=Q6L2SF6YDW\n";
+
+    fn tmp_app(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("mcp-apps-{}-{name}", std::process::id())).join(format!("{name}.app"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn wrapped_ios_detection() {
+        // eBay-style: Wrapper/ folder + WrappedBundle link, no Contents/Info.plist.
+        let a = tmp_app("eBay");
+        std::fs::create_dir_all(a.join("Wrapper/eBay.app")).unwrap();
+        std::os::unix::fs::symlink("Wrapper/eBay.app", a.join("WrappedBundle")).unwrap();
+        assert!(is_wrapped_ios(&a));
+        // Only a Wrapper folder.
+        let b = tmp_app("OnlyWrapper");
+        std::fs::create_dir_all(b.join("Wrapper/X.app")).unwrap();
+        assert!(is_wrapped_ios(&b));
+        // A normal Mac app is not wrapped, even if it happens to contain a Wrapper folder.
+        let c = tmp_app("Mac");
+        std::fs::create_dir_all(c.join("Contents/MacOS")).unwrap();
+        std::fs::write(c.join("Contents/Info.plist"), "<plist/>").unwrap();
+        assert!(!is_wrapped_ios(&c));
+        std::fs::create_dir_all(c.join("Wrapper")).unwrap();
+        assert!(!is_wrapped_ios(&c));
+        // An empty bundle is not.
+        assert!(!is_wrapped_ios(&tmp_app("Empty")));
+        for p in [a, b, c] {
+            let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn ios_app_store_classification() {
+        let strict_fail = (false, format!("/Applications/Grays.app: {IOS_OBSOLETE_ENVELOPE}\n"));
+        let r = RejectedApp { wrapped_ios: true, codesign_dv: IOS_DV.into(), verify_strict: strict_fail.clone(), verify_fallback: Some(true), spctl: "/Applications/Grays.app: rejected\norigin=Apple iPhone OS Application Signing\n".into() };
+        assert_eq!(classify_rejected(&r), AppVerdict::IosAppStore { team: "7C9N6X87GL".into() });
+        assert_eq!(classify_rejected(&RejectedApp { verify_strict: (true, String::new()), verify_fallback: None, ..r.clone() }), AppVerdict::IosAppStore { team: "7C9N6X87GL".into() });
+        // Hashes/designated requirement don't verify → still a warning.
+        assert_eq!(classify_rejected(&RejectedApp { verify_fallback: Some(false), ..r.clone() }), AppVerdict::Rejected);
+        // Any other verification failure → warning.
+        assert_eq!(classify_rejected(&RejectedApp { verify_strict: (false, "/A.app: a sealed resource is missing or invalid\n".into()), ..r.clone() }), AppVerdict::Rejected);
+        // No real team → warning.
+        assert_eq!(classify_rejected(&RejectedApp { codesign_dv: IOS_DV.replace("TeamIdentifier=7C9N6X87GL", "TeamIdentifier=not set"), ..r.clone() }), AppVerdict::Rejected);
+        // Not signed by Apple's App Store identity (e.g. ad-hoc) → warning.
+        assert_eq!(classify_rejected(&RejectedApp { codesign_dv: "Identifier=x\nSignature=adhoc\nTeamIdentifier=ABCDE12345\n".into(), ..r.clone() }), AppVerdict::Rejected);
+        // Not a wrapped bundle → not treated as an iOS app.
+        assert_eq!(classify_rejected(&RejectedApp { wrapped_ios: false, ..r }), AppVerdict::Rejected);
+    }
+
+    #[test]
+    fn developer_id_not_notarized_classification() {
+        let r = RejectedApp {
+            wrapped_ios: false,
+            codesign_dv: DEVID_DV.into(),
+            verify_strict: (true, String::new()),
+            verify_fallback: None,
+            spctl: "/Users/x/Applications/Some.app: rejected\nsource=Unnotarized Developer ID\norigin=Developer ID Application: Anthropic PBC (Q6L2SF6YDW)\n".into(),
+        };
+        let want = AppVerdict::SignedNotNotarized { signer: "Anthropic PBC (Q6L2SF6YDW)".into() };
+        assert_eq!(classify_rejected(&r), want);
+        // Claude Code URL Handler: bundle check only complains about missing resources; the executable verifies.
+        let handler = RejectedApp { verify_strict: (false, format!("/Users/x/Applications/Claude Code URL Handler.app: {NO_RESOURCES}\n")), verify_fallback: Some(true), ..r.clone() };
+        assert_eq!(classify_rejected(&handler), want);
+        assert_eq!(classify_rejected(&RejectedApp { verify_fallback: Some(false), ..handler }), AppVerdict::Rejected);
+        // Tampered bundle → warning.
+        assert_eq!(classify_rejected(&RejectedApp { verify_strict: (false, "/A.app: a sealed resource is missing or invalid\n".into()), ..r.clone() }), AppVerdict::Rejected);
+        // Revoked certificate → warning.
+        assert_eq!(classify_rejected(&RejectedApp { spctl: "/A.app: CSSMERR_TP_CERT_REVOKED\n".into(), ..r.clone() }), AppVerdict::Rejected);
+        // Unsigned / ad-hoc stay warnings.
+        assert_eq!(classify_rejected(&RejectedApp { codesign_dv: "/A.app: code object is not signed at all\n".into(), ..r.clone() }), AppVerdict::Rejected);
+        assert_eq!(classify_rejected(&RejectedApp { codesign_dv: "Identifier=a\nSignature=adhoc\nTeamIdentifier=not set\n".into(), ..r.clone() }), AppVerdict::Rejected);
+        // Team must match the Developer ID certificate.
+        assert_eq!(classify_rejected(&RejectedApp { codesign_dv: DEVID_DV.replace("TeamIdentifier=Q6L2SF6YDW", "TeamIdentifier=ZZZZZZZZZZ"), ..r }), AppVerdict::Rejected);
+    }
+
+    #[test]
+    fn only_reason_parse() {
+        assert!(only_reason(&format!("/A.app: {IOS_OBSOLETE_ENVELOPE}\n"), IOS_OBSOLETE_ENVELOPE));
+        assert!(!only_reason(&format!("/A.app: {IOS_OBSOLETE_ENVELOPE}\n/A.app: a sealed resource is missing or invalid\n"), IOS_OBSOLETE_ENVELOPE));
+        assert!(!only_reason("", IOS_OBSOLETE_ENVELOPE));
     }
 
     #[test]

@@ -17,6 +17,9 @@ USAGE:
                                       (deletes nothing)
   mac-cleaner-pro --background-scan   weekly job: scan + audit, post one notification
   mac-cleaner-pro --update-schedule   point an enabled weekly job at this binary
+  mac-cleaner-pro --trust LABEL       mark an installed startup item as trusted by you
+                                      (label + program path + SHA-256 of the program)
+  mac-cleaner-pro --untrust LABEL     remove that trust entry
   mac-cleaner-pro --help
 ";
 
@@ -45,6 +48,24 @@ pub fn run(args: &[String]) -> Option<i32> {
             println!("weekly job not enabled; nothing to update");
         }
         return Some(0);
+    }
+    for (flag, trust) in [("--trust", true), ("--untrust", false)] {
+        if let Some(i) = args.iter().position(|a| a == flag) {
+            let Some(label) = args.get(i + 1).filter(|l| !l.starts_with("--")) else {
+                eprintln!("{flag} needs a launchd label, e.g. {flag} com.example.agent");
+                return Some(2);
+            };
+            return Some(match trust_cli(label, trust) {
+                Ok(msg) => {
+                    println!("{msg}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                }
+            });
+        }
     }
     if has("--dry-run-clean") {
         dry_run_clean();
@@ -77,6 +98,18 @@ pub fn run(args: &[String]) -> Option<i32> {
         return Some(2);
     }
     None
+}
+
+/// `--trust` / `--untrust`: same steps as the GUI's "Mark as trusted" / "Untrust".
+fn trust_cli(label: &str, trust: bool) -> Result<String, String> {
+    use security::checks::persistence::{find_launch_item, item_program, trust_fix, untrust_fix};
+    let ctx = security::Ctx::new(false);
+    let item = find_launch_item(&ctx.home, label).ok_or_else(|| format!("no startup item with label {label} in ~/Library/LaunchAgents, /Library/LaunchAgents or /Library/LaunchDaemons"))?;
+    let program = item_program(&item, &ctx.home).ok_or_else(|| format!("{label} has no Program/ProgramArguments"))?;
+    let sha = security::trusted::sha256_file(&program)?;
+    let fx = if trust { trust_fix(&item, &program, &sha, &ctx) } else { untrust_fix(&item, &program, &sha, &ctx) };
+    let log = security::fix::apply_steps(&fx.steps, false)?;
+    Ok(log.join("\n"))
 }
 
 fn dry_run_clean() {

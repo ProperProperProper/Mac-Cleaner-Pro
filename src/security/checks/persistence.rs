@@ -53,6 +53,17 @@ pub fn parse_codesign(out: &str) -> Sig {
     Sig::Unknown(out.lines().next().unwrap_or("").to_string())
 }
 
+/// `TeamIdentifier=` from `codesign -dvv` output; None if missing or "not set".
+pub fn parse_team(out: &str) -> Option<String> {
+    let t = out.lines().find_map(|l| l.strip_prefix("TeamIdentifier="))?.trim();
+    (!t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric())).then(|| t.to_string())
+}
+
+/// `Executable=` (main executable path) from `codesign -dvv` output.
+pub fn parse_executable(out: &str) -> Option<String> {
+    out.lines().find_map(|l| l.strip_prefix("Executable=")).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 /// Parse `spctl -a -vv` output → (accepted, source).
 pub fn parse_spctl(out: &str) -> (bool, String) {
     let accepted = out.lines().next().map(|l| l.trim_end().ends_with(": accepted")).unwrap_or(false);
@@ -195,6 +206,56 @@ pub fn quarantine_fix(item: &LaunchItem, system: bool, ctx: &Ctx) -> Fix {
     }
 }
 
+/// "Mark as trusted": records label + program + the SHA-256 seen in this audit.
+pub fn trust_fix(item: &LaunchItem, program: &Path, sha256: &str, ctx: &Ctx) -> Fix {
+    let file = ctx.trust_file().display().to_string();
+    let program = program.display().to_string();
+    Fix::new("Mark as trusted")
+        .change(format!(
+            "Records {} as trusted by you in {} (label + program path + SHA-256 of the program). If the program file changes, trust is dropped automatically. Nothing on the system is changed.",
+            item.label,
+            tilde(Path::new(&file))
+        ))
+        .step(Step::Trust { file: file.clone(), label: item.label.clone(), program: program.clone(), sha256: sha256.into() })
+        .undo(vec![Step::Untrust { file, label: item.label.clone(), program }])
+}
+
+pub fn untrust_fix(item: &LaunchItem, program: &Path, sha256: &str, ctx: &Ctx) -> Fix {
+    let file = ctx.trust_file().display().to_string();
+    let program = program.display().to_string();
+    Fix::new("Untrust")
+        .change(format!("Removes {} from your trusted startup items; it will be flagged for review again.", item.label))
+        .step(Step::Untrust { file: file.clone(), label: item.label.clone(), program: program.clone() })
+        .undo(vec![Step::Trust { file, label: item.label.clone(), program, sha256: sha256.into() }])
+}
+
+/// Find an installed launch item by its label (for `--trust <label>`).
+pub fn find_launch_item(home: &Path, label: &str) -> Option<LaunchItem> {
+    for (dir, _) in launch_dirs(home) {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let mut paths: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "plist") && p.is_file()).collect();
+        paths.sort();
+        for p in paths {
+            if let Some(it) = read_launch_item(&p)
+                && it.label == label
+            {
+                return Some(it);
+            }
+        }
+    }
+    None
+}
+
+/// The program file a launch item runs (absolute, `~/` expanded).
+pub fn item_program(item: &LaunchItem, home: &Path) -> Option<PathBuf> {
+    item.target.as_ref().map(|t| expand(&t.target, home))
+}
+
+/// Folders the audit must never read (they trigger macOS privacy prompts).
+fn privacy_protected(p: &Path, home: &Path) -> bool {
+    ["Desktop", "Documents", "Downloads"].iter().any(|d| p.starts_with(home.join(d)))
+}
+
 pub fn launch_items(ctx: &Ctx) -> Vec<Finding> {
     let mut out = vec![];
     let mut total = 0;
@@ -267,18 +328,45 @@ fn analyse_item(p: &Path, system: bool, ctx: &Ctx) -> Finding {
     ev.push(format!("Gatekeeper assessment: {}{}", if accepted { "accepted" } else { "rejected" }, if source.is_empty() { String::new() } else { format!(" ({source})") }));
     let ok = matches!(sig, Sig::Apple) || (matches!(sig, Sig::DeveloperId(_)) && accepted);
     if ok {
-        Finding::new(Persistence, title, Status::Ok, format!("Runs a properly signed program ({}).", sig.describe())).evidence_all(ev).explain(why)
-    } else {
-        Finding::new(
-            Persistence,
-            title,
-            Status::Warning,
-            format!("Review: runs {} {}.", if script { "a script," } else { "a program" }, sig.describe()),
-        )
-        .evidence_all(ev)
-        .explain(why)
-        .fix_text("If you installed or wrote this yourself, it is fine. If you don't recognise it, quarantine it (moves the plist aside, reversible) and investigate the program.")
-        .with_fix(qfix)
+        return Finding::new(Persistence, title, Status::Ok, format!("Runs a properly signed program ({}).", sig.describe())).evidence_all(ev).explain(why);
+    }
+    let what = format!("{} {}", if script { "a script," } else { "a program" }, sig.describe());
+    // User trust: hash the program only if it is outside privacy-protected folders.
+    let readable = !privacy_protected(&target, &ctx.home);
+    let store = super::super::trusted::TrustStore::load(&ctx.trust_file());
+    let state = if readable { store.state(&item.label, &target) } else { super::super::trusted::TrustState::NotTrusted };
+    let sha = if readable { super::super::trusted::sha256_file(&target).ok() } else { None };
+    use super::super::trusted::TrustState;
+    match (state, sha) {
+        (TrustState::Trusted, Some(h)) => {
+            let trusted_at = store.lookup(&item.label, &ts).map(|e| e.trusted_at.clone()).unwrap_or_default();
+            ev.push(format!("trusted by you on {trusted_at} (program SHA-256 unchanged: {})", &h[..16]));
+            Finding::new(Persistence, title, Status::Info, format!("Trusted by you: runs {what}."))
+                .evidence_all(ev)
+                .explain(why)
+                .fix_text("You marked this item as trusted. If the program file changes, it will be flagged for review again.")
+                .with_fix(untrust_fix(&item, &target, &h, ctx))
+                .with_fix(qfix)
+        }
+        (state, sha) => {
+            let changed = state == TrustState::Changed;
+            if changed {
+                ev.push("was trusted by you, but the program file has changed since (SHA-256 differs)".into());
+            }
+            let mut f = Finding::new(
+                Persistence,
+                title,
+                Status::Warning,
+                if changed { format!("Review: trusted earlier, but the program changed — runs {what}.") } else { format!("Review: runs {what}.") },
+            )
+            .evidence_all(ev)
+            .explain(why)
+            .fix_text("If you installed or wrote this yourself, mark it as trusted (only you can do this; a changed program loses trust automatically). If you don't recognise it, quarantine it (moves the plist aside, reversible) and investigate the program.");
+            if let Some(h) = sha {
+                f = f.with_fix(trust_fix(&item, &target, &h, ctx));
+            }
+            f.with_fix(qfix)
+        }
     }
 }
 
@@ -397,6 +485,31 @@ mod tests {
             Sig::DeveloperId("Developer ID Application: Objective-See, LLC (VBG97UB4TA)".into())
         );
         assert!(matches!(parse_codesign("/x: No such file or directory"), Sig::Unknown(_)));
+    }
+
+    #[test]
+    fn team_and_executable() {
+        let dv = "Executable=/Applications/eBay.app/Wrapper/eBay.app/eBay\nIdentifier=com.ebay.iphone\nTeamIdentifier=QYHMMGCMJR\n";
+        assert_eq!(parse_team(dv), Some("QYHMMGCMJR".into()));
+        assert_eq!(parse_executable(dv).as_deref(), Some("/Applications/eBay.app/Wrapper/eBay.app/eBay"));
+        assert_eq!(parse_team("Signature=adhoc\nTeamIdentifier=not set\n"), None);
+        assert_eq!(parse_team("Identifier=x\n"), None);
+    }
+
+    #[test]
+    fn trust_fix_is_reversible_and_local() {
+        let ctx = Ctx::with_home(PathBuf::from("/Users/x"));
+        let item = LaunchItem { plist: "/Users/x/Library/LaunchAgents/com.a.plist".into(), label: "com.a".into(), target: None, env_names: vec![], disabled: false };
+        let f = trust_fix(&item, Path::new("/Users/x/bin/a.sh"), "ab12", &ctx);
+        assert!(f.is_trust_action());
+        assert!(!f.needs_admin());
+        assert!(matches!(&f.steps[0], Step::Trust { file, label, sha256, .. } if file == "/Users/x/Library/Application Support/Mac Cleaner Pro/trusted-startup-items.json" && label == "com.a" && sha256 == "ab12"));
+        assert!(matches!(&f.undo.as_ref().unwrap()[0], Step::Untrust { .. }));
+        let u = untrust_fix(&item, Path::new("/Users/x/bin/a.sh"), "ab12", &ctx);
+        assert!(u.is_trust_action());
+        assert!(matches!(&u.undo.as_ref().unwrap()[0], Step::Trust { .. }));
+        assert!(privacy_protected(Path::new("/Users/x/Documents/a.sh"), Path::new("/Users/x")));
+        assert!(!privacy_protected(Path::new("/Users/x/bin/a.sh"), Path::new("/Users/x")));
     }
 
     #[test]

@@ -16,6 +16,7 @@
 pub mod checks;
 pub mod fix;
 pub mod report;
+pub mod trusted;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -208,6 +209,10 @@ impl Ctx {
         self.home
             .join("Library/Application Support/MacCleanerPro/Quarantine")
             .join(&self.stamp)
+    }
+    /// Startup items the user marked as trusted (see `trusted`).
+    pub fn trust_file(&self) -> PathBuf {
+        trusted::default_path(&self.home)
     }
     pub fn backup_dir(&self) -> PathBuf {
         self.home.join("Library/Application Support/MacCleanerPro/Backups")
